@@ -40,11 +40,55 @@ enum Action {
 enum UIState {
     Main,
     AskPassword,
+    PasswordError,
     ConfirmReboot,
-    Rebooting,
+    CountdownReboot(u8),
 }
 
-// ---------- Layout helpers ----------
+fn execute_sudo_command(args: &[&str], password: &str) -> Result<bool, Box<dyn std::error::Error>> {
+    let mut child = Command::new("sudo")
+        .arg("-S")
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    
+    // Write password immediately
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin.write_all(password.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        drop(stdin);
+    }
+    
+    let output = child.wait_with_output()?;
+    
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    
+    if stderr_text.contains("Sorry") || stderr_text.contains("try again") {
+        return Ok(false);
+    }
+    
+    Ok(output.status.success())
+}
+
+fn execute_set_boot_order(order_ids: &[String], password: &str) -> Result<UIState, Box<dyn std::error::Error>> {
+    let order = order_ids.join(",");
+    if execute_sudo_command(&["efibootmgr", "-o", &order], password)? {
+        Ok(UIState::ConfirmReboot)
+    } else {
+        Ok(UIState::PasswordError)
+    }
+}
+
+fn execute_boot_once(id: &str, password: &str) -> Result<UIState, Box<dyn std::error::Error>> {
+    if execute_sudo_command(&["efibootmgr", "-n", id], password)? {
+        Ok(UIState::CountdownReboot(5))
+    } else {
+        Ok(UIState::PasswordError)
+    }
+}
 
 fn center(area: Rect, width: u16, height: u16) -> Rect {
     Rect::new(
@@ -65,8 +109,6 @@ fn centered_area(area: Rect, width_pct: u16, height_pct: u16) -> Rect {
         h,
     )
 }
-
-// ---------- EFI helpers ----------
 
 fn fetch_boot_entries() -> Vec<BootEntry> {
     let output = Command::new("efibootmgr")
@@ -104,8 +146,6 @@ fn fetch_boot_order() -> Vec<String> {
         })
         .unwrap_or_default()
 }
-
-// ---------- Draw main UI ----------
 
 fn draw_main_ui(
     f: &mut ratatui::Frame,
@@ -176,7 +216,6 @@ fn draw_main_ui(
         layout[2],
     );
 
-    // Footer keybind bar
     let footer = "Tab: Switch panel  |  ↑/↓: Move  |  u/d: Reorder priority  |  Enter: Apply/Boot  |  q: Quit";
     f.render_widget(
         Paragraph::new(footer)
@@ -186,11 +225,9 @@ fn draw_main_ui(
     );
 }
 
-// ---------- Password modal (transparent, thin bar) ----------
-
 fn draw_password_popup(f: &mut ratatui::Frame, area: Rect, password: &str, show: bool) {
     let popup_width = area.width * 3 / 4;
-    let popup_height = 5;
+    let popup_height = 6;
     let popup = center(area, popup_width, popup_height);
 
     f.render_widget(
@@ -203,9 +240,9 @@ fn draw_password_popup(f: &mut ratatui::Frame, area: Rect, password: &str, show:
     let inner = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // label
-            Constraint::Length(1), // thin input
-            Constraint::Length(1), // help
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(Rect {
             x: popup.x + 1,
@@ -217,7 +254,7 @@ fn draw_password_popup(f: &mut ratatui::Frame, area: Rect, password: &str, show:
     f.render_widget(
         Paragraph::new("Enter sudo password")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Yellow)),
+            .style(Style::default().fg(Color::White)),
         inner[0],
     );
 
@@ -230,7 +267,7 @@ fn draw_password_popup(f: &mut ratatui::Frame, area: Rect, password: &str, show:
     let bar_width = popup_width / 2;
     let bar_area = Rect {
         x: popup.x + (popup.width - bar_width) / 2,
-        y: inner[1].y,
+        y: inner[2].y,
         width: bar_width,
         height: 1,
     };
@@ -239,22 +276,27 @@ fn draw_password_popup(f: &mut ratatui::Frame, area: Rect, password: &str, show:
         Paragraph::new(format!(" {}", displayed))
             .style(
                 Style::default()
-                    .bg(Color::Rgb(200, 180, 140))
+                    .bg(Color::Cyan)
                     .fg(Color::Black),
             )
             .alignment(Alignment::Left),
         bar_area,
     );
 
+    let help_area = Rect {
+        x: area.x,
+        y: popup.y + popup_height + 1,
+        width: area.width,
+        height: 1,
+    };
+
     f.render_widget(
-        Paragraph::new("Enter = Confirm   •   Esc = Cancel   •   Tab = Show/Hide")
+        Paragraph::new("Enter = Confirm  |  Esc = Cancel  |  Tab = Show/Hide")
             .alignment(Alignment::Center)
-            .style(Style::default().fg(Color::Gray)),
-        inner[2],
+            .style(Style::default().fg(Color::DarkGray)),
+        help_area,
     );
 }
-
-// ---------- Reboot confirm modal ----------
 
 fn draw_reboot_popup(f: &mut ratatui::Frame, area: Rect, yes_selected: bool) {
     let popup_width = area.width / 3;
@@ -316,17 +358,13 @@ fn draw_reboot_popup(f: &mut ratatui::Frame, area: Rect, yes_selected: bool) {
     );
 }
 
-// ---------- Rebooting screen ----------
-
-fn draw_rebooting_screen(f: &mut ratatui::Frame, area: Rect) {
-    f.render_widget(
-        Block::default().style(Style::default().bg(Color::Black)),
-        area,
-    );
-    let popup = center(area, area.width / 3, 5);
+fn draw_processing_screen(f: &mut ratatui::Frame, area: Rect) {
+    let popup_width = area.width / 3;
+    let popup_height = 5;
+    let popup = center(area, popup_width, popup_height);
 
     f.render_widget(
-        Paragraph::new("Rebooting…")
+        Paragraph::new("Processing...")
             .alignment(Alignment::Center)
             .style(Style::default().fg(Color::Cyan).bold())
             .block(Block::default().borders(Borders::ALL)),
@@ -334,7 +372,108 @@ fn draw_rebooting_screen(f: &mut ratatui::Frame, area: Rect) {
     );
 }
 
-// ---------- main ----------
+fn draw_password_error_popup(f: &mut ratatui::Frame, area: Rect) {
+    let popup_width = area.width / 2;
+    let popup_height = 7;
+    let popup = center(area, popup_width, popup_height);
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Authentication Failed ")
+            .style(Style::default().fg(Color::Red)),
+        popup,
+    );
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width - 2,
+            height: popup.height - 2,
+        });
+
+    f.render_widget(
+        Paragraph::new("Incorrect password!")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Red).bold()),
+        inner[0],
+    );
+
+    f.render_widget(
+        Paragraph::new("Please try again.")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White)),
+        inner[1],
+    );
+
+    f.render_widget(
+        Paragraph::new("Press any key to continue")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Gray)),
+        inner[2],
+    );
+}
+
+fn draw_countdown_screen(f: &mut ratatui::Frame, area: Rect, seconds: u8) {
+    let popup_width = area.width / 2;
+    let popup_height = 8;
+    let popup = center(area, popup_width, popup_height);
+
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Rebooting ")
+            .style(Style::default().fg(Color::Cyan)),
+        popup,
+    );
+
+    let inner = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Length(2),
+            Constraint::Length(1),
+        ])
+        .split(Rect {
+            x: popup.x + 1,
+            y: popup.y + 1,
+            width: popup.width - 2,
+            height: popup.height - 2,
+        });
+
+    f.render_widget(
+        Paragraph::new(format!("Rebooting in {} second{}...", seconds, if seconds == 1 { "" } else { "s" }))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::White)),
+        inner[0],
+    );
+
+    let progress = (5 - seconds) as f32 / 5.0;
+    let bar_width = (popup_width - 10) as f32 * progress;
+    let filled = "█".repeat(bar_width as usize);
+    let empty = "░".repeat((popup_width - 10) as usize - bar_width as usize);
+    
+    f.render_widget(
+        Paragraph::new(format!("{}{}", filled, empty))
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::Cyan)),
+        inner[1],
+    );
+
+    f.render_widget(
+        Paragraph::new("Press Esc to cancel")
+            .alignment(Alignment::Center)
+            .style(Style::default().fg(Color::DarkGray)),
+        inner[2],
+    );
+}
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut entries = fetch_boot_entries();
@@ -358,6 +497,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut show_password = false;
     let mut pending_action = Action::None;
     let mut reboot_yes = true;
+    let mut last_tick = std::time::Instant::now();
 
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -365,12 +505,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    while !matches!(state, UIState::Rebooting) {
+    loop {
         terminal.draw(|f| {
-            // shrink + center the whole UI (like the WiFi dialog)
             let area = centered_area(f.area(), 65, 60);
 
-            match state {
+            match &state {
                 UIState::Main => draw_main_ui(
                     f,
                     area,
@@ -380,16 +519,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     selected_boot_once,
                 ),
                 UIState::AskPassword => draw_password_popup(f, area, &password, show_password),
+                UIState::PasswordError => draw_password_error_popup(f, area),
                 UIState::ConfirmReboot => draw_reboot_popup(f, area, reboot_yes),
-                UIState::Rebooting => draw_rebooting_screen(f, area),
+                UIState::CountdownReboot(seconds) => draw_countdown_screen(f, area, *seconds),
             }
         })?;
 
-        if matches!(state, UIState::Rebooting) {
-            break;
+        if let UIState::CountdownReboot(seconds) = state {
+            if last_tick.elapsed() >= Duration::from_secs(1) {
+                last_tick = std::time::Instant::now();
+                if seconds > 1 {
+                    state = UIState::CountdownReboot(seconds - 1);
+                } else {
+                    let mut reboot = Command::new("sudo")
+                        .arg("reboot")
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .spawn()?;
+                    let _ = reboot.wait();
+                    break;
+                }
+            }
         }
 
-        if event::poll(Duration::from_millis(200))? {
+        if event::poll(Duration::from_millis(50))? {
             if let Event::Key(key) = event::read()? {
                 match state {
                     UIState::Main => match key.code {
@@ -463,52 +617,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         KeyCode::Backspace => {
                             password.pop();
                         }
-                        KeyCode::Enter => match pending_action.clone() {
-                            Action::SetOrder(order_ids) => {
-                                let mut child = Command::new("sudo")
-                                    .arg("-S")
-                                    .arg("efibootmgr")
-                                    .arg("-o")
-                                    .arg(order_ids.join(","))
-                                    .stdin(Stdio::piped())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .spawn()?;
-                                if let Some(mut stdin) = child.stdin.take() {
-                                    stdin.write_all(format!("{password}\n").as_bytes())?;
+                        KeyCode::Enter => {
+                            terminal.draw(|f| {
+                                let area = centered_area(f.area(), 65, 60);
+                                draw_processing_screen(f, area);
+                            })?;
+                            
+                            state = match pending_action.clone() {
+                                Action::SetOrder(order_ids) => {
+                                    execute_set_boot_order(&order_ids, &password)?
                                 }
-                                state = UIState::ConfirmReboot;
+                                Action::BootOnce(id) => {
+                                    execute_boot_once(&id, &password)?
+                                }
+                                Action::None => UIState::Main,
+                            };
+                            
+                            if matches!(state, UIState::PasswordError) {
+                                password.clear();
                             }
-                            Action::BootOnce(id) => {
-                                let mut child = Command::new("sudo")
-                                    .arg("-S")
-                                    .arg("efibootmgr")
-                                    .arg("-n")
-                                    .arg(&id)
-                                    .stdin(Stdio::piped())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .spawn()?;
-                                if let Some(mut stdin) = child.stdin.take() {
-                                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                                }
-                                state = UIState::Rebooting;
-                                let mut reboot = Command::new("sudo")
-                                    .arg("-S")
-                                    .arg("reboot")
-                                    .stdin(Stdio::piped())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .spawn()?;
-                                if let Some(mut stdin) = reboot.stdin.take() {
-                                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                                }
-                            }
-                            Action::None => state = UIState::Main,
                         },
                         KeyCode::Char(c) => password.push(c),
                         _ => {}
                     },
+
+                    UIState::PasswordError => {
+                        state = UIState::AskPassword;
+                    }
 
                     UIState::ConfirmReboot => match key.code {
                         KeyCode::Esc => {
@@ -519,17 +654,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                         KeyCode::Enter => {
                             if reboot_yes {
-                                state = UIState::Rebooting;
-                                let mut reboot = Command::new("sudo")
-                                    .arg("-S")
-                                    .arg("reboot")
-                                    .stdin(Stdio::piped())
-                                    .stdout(Stdio::null())
-                                    .stderr(Stdio::null())
-                                    .spawn()?;
-                                if let Some(mut stdin) = reboot.stdin.take() {
-                                    stdin.write_all(format!("{password}\n").as_bytes())?;
-                                }
+                                state = UIState::CountdownReboot(5);
+                                last_tick = std::time::Instant::now();
                             } else {
                                 state = UIState::Main;
                             }
@@ -537,7 +663,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         _ => {}
                     },
 
-                    UIState::Rebooting => {}
+                    UIState::CountdownReboot(_) => {
+                        if let KeyCode::Esc = key.code {
+                            state = UIState::Main;
+                        }
+                    }
                 }
             }
         }
