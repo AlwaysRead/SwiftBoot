@@ -245,7 +245,7 @@ fn draw_main_ui(
 
     f.render_widget(
         List::new(boot_once_items)
-            .block(Block::default().title(" Boot Once ").borders(Borders::ALL)),
+            .block(Block::default().title(" Boot To ").borders(Borders::ALL)),
         layout[2],
     );
 
@@ -592,8 +592,8 @@ fn draw_help_screen(f: &mut ratatui::Frame, area: Rect) {
         "  u/d              Move entry up/down in boot order",
         "  Enter            Apply new boot order (requires reboot)",
         "",
-        "Boot Once Panel:",
-        "  Enter            Boot selected entry on next reboot only",
+        "Boot To Panel:",
+        "  Enter            Boot directly to selected OS",
         "",
         "Password Dialog:",
         "  Tab              Toggle password visibility",
